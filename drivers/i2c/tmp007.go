@@ -130,32 +130,34 @@ func (d *TMP007Driver) read(address byte, n int) ([]byte, error) {
 // ReadDieTempC returns the die temperature in degrees Celcius
 func (d *TMP007Driver) ReadDieTempC() float64 {
 	b, _ := d.read(tmp007RegisterTDie, 2)
-	raw := uint16(b[0])<<8 | uint16(b[1])
+	raw := int16(b[0])<<8 | int16(b[1])
 	raw = raw >> 2
 
+	// 0.03125°C per LSB
 	tDie := float64(raw) * 0.03125 // convert to Celcius
 
 	return tDie
 }
 
-// ReadRawVoltage returns the voltage sensor value in microvolts
-func (d *TMP007Driver) ReadRawVoltage() float64 {
-	b, _ := d.read(tmp007RegisterVSensor, 2)
-	raw := uint16(b[0])<<8 | uint16(b[1])
-
-	vSensor := float64(raw) * 156.25
-	vSensor /= 1000 // microvolts
-
-	return vSensor
-}
-
 // ReadObjTempC returns the object temperature in degrees Celcius
 func (d *TMP007Driver) ReadObjTempC() float64 {
 	b, _ := d.read(tmp007RegisterTObj, 2)
-	raw := uint16(b[0])<<8 | uint16(b[1])
+	raw := int16(b[0])<<8 | int16(b[1])
 	raw = raw >> 2 // trim nDV[0] and empty bit[1]
 
+	// 0.03125°C per LSB
 	tObj := float64(raw) * 0.03125 // convert to Celcius
 
 	return tObj
+}
+
+// ReadSensorVoltage returns the sensor voltage output value in microvolts
+func (d *TMP007Driver) ReadSensorVoltage() float64 {
+	b, _ := d.read(tmp007RegisterVSensor, 2)
+	raw := int16(b[0])<<8 | int16(b[1])
+
+	// Resolution: 156.25 nV/LSB
+	vSensor := (float64(raw) * 156.25) / 1000 // convert to uV
+
+	return vSensor
 }
