@@ -79,6 +79,11 @@ func (d *TMP007Driver) SetName(n string) {
 	d.name = n
 }
 
+// DeviceID returns the 16bit Device ID register value.
+func (d *TMP007Driver) DeviceID() uint16 {
+	return d.deviceID.didrid
+}
+
 // Connection returns the connection of the device.
 func (d *TMP007Driver) Connection() gobot.Connection {
 	return d.connector.(gobot.Connection)
@@ -122,7 +127,35 @@ func (d *TMP007Driver) read(address byte, n int) ([]byte, error) {
 	return buf, nil
 }
 
-// func readRawDieTemperature() {}
-// func readRawVoltage()        {}
-// func readObjTempC()          {}
-// func readDieTempC()          {}
+// ReadDieTempC returns the die temperature in degrees Celcius
+func (d *TMP007Driver) ReadDieTempC() float64 {
+	b, _ := d.read(tmp007RegisterTDie, 2)
+	raw := uint16(b[0])<<8 | uint16(b[1])
+	raw = raw >> 2
+
+	tDie := float64(raw) * 0.03125 // convert to Celcius
+
+	return tDie
+}
+
+// ReadRawVoltage returns the voltage sensor value in microvolts
+func (d *TMP007Driver) ReadRawVoltage() float64 {
+	b, _ := d.read(tmp007RegisterVSensor, 2)
+	raw := uint16(b[0])<<8 | uint16(b[1])
+
+	vSensor := float64(raw) * 156.25
+	vSensor /= 1000 // microvolts
+
+	return vSensor
+}
+
+// ReadObjTempC returns the object temperature in degrees Celcius
+func (d *TMP007Driver) ReadObjTempC() float64 {
+	b, _ := d.read(tmp007RegisterTObj, 2)
+	raw := uint16(b[0])<<8 | uint16(b[1])
+	raw = raw >> 2 // trim nDV[0] and empty bit[1]
+
+	tObj := float64(raw) * 0.03125 // convert to Celcius
+
+	return tObj
+}
