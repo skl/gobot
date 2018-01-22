@@ -3,6 +3,8 @@ package i2c
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"time"
 
 	"gobot.io/x/gobot"
 )
@@ -18,19 +20,19 @@ const (
 	tmp007RegisterStatusMask = 0x05
 	tmp007RegisterDeviceID   = 0x1F
 
-	tmp007ConfigReset                     = 0x8000
-	tmp007ConfigModeOn                    = 0x1000
-	tmp007Config1Sample                   = 0x0000
-	tmp007Config2Sample                   = 0x0200
-	tmp007Config4Sample                   = 0x0400
-	tmp007Config8Sample                   = 0x0600
-	tmp007Config16Sample                  = 0x0800
-	tmp007ConfigAlertEnable               = 0x0100
-	tmp007ConfigAlertFlag                 = 0x0080
-	tmp007ConfigTransientCorrectionEnable = 0x0040
+	tmp007ConfigReset     = 0x8000
+	tmp007ConfigConvEN    = 0x1000
+	tmp007Config1Sample   = 0x0000
+	tmp007Config2Sample   = 0x0200
+	tmp007Config4Sample   = 0x0400
+	tmp007Config8Sample   = 0x0600
+	tmp007Config16Sample  = 0x0800
+	tmp007ConfigAlertEN   = 0x0100
+	tmp007ConfigAlertFlag = 0x0080
+	tmp007ConfigTCEN      = 0x0040
 
-	tmp007StatusAlertEnable     = 0x8000
-	tmp007StatusConversionReady = 0x4000
+	tmp007MaskALRTEN = 0x8000
+	tmp007MaskCRTEN  = 0x4000
 )
 
 type deviceID struct {
@@ -110,7 +112,19 @@ func (d *TMP007Driver) initialization() (err error) {
 	buf := bytes.NewBuffer(deviceID)
 	binary.Read(buf, binary.BigEndian, &d.deviceID.didrid)
 
-	return nil
+	if d.deviceID.didrid != 0x78 {
+		return errors.New("TMP007 not detected")
+	}
+
+	// Enable ADC conversion
+	configInt := uint16(tmp007ConfigConvEN)
+	if err = d.write(tmp007RegisterConfig, configInt); err != nil {
+		return err
+	}
+
+	// Enable conversion ready alert flag
+	statusMaskInt := uint16(tmp007MaskCRTEN)
+	return d.write(tmp007RegisterStatusMask, statusMaskInt)
 }
 
 func (d *TMP007Driver) read(address byte, n int) ([]byte, error) {
@@ -119,45 +133,107 @@ func (d *TMP007Driver) read(address byte, n int) ([]byte, error) {
 	}
 
 	buf := make([]byte, n)
-	bytesRead, err := d.connection.Read(buf)
-	if bytesRead != n || err != nil {
-		return nil, err
+
+	var err error
+	var bytesRead int
+	numRetries := 50
+	for numRetries > 0 {
+		bytesRead, err = d.connection.Read(buf)
+		if bytesRead == n && err == nil {
+			break
+		}
+		numRetries--
 	}
 
-	return buf, nil
+	return buf, err
+}
+
+func (d *TMP007Driver) write(address byte, data uint16) error {
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b[0:], data)
+
+	return d.connection.WriteBlockData(address, b)
+}
+
+func nDVtoBool(raw int16) bool {
+	if (raw & 0x01) != 0 {
+		return false
+	}
+	return true
 }
 
 // ReadDieTempC returns the die temperature in degrees Celcius
-func (d *TMP007Driver) ReadDieTempC() float64 {
-	b, _ := d.read(tmp007RegisterTDie, 2)
+func (d *TMP007Driver) ReadDieTempC() (float64, error) {
+	b, err := d.read(tmp007RegisterTDie, 2)
+	if err != nil {
+		return 0.0, err
+	}
 	raw := int16(b[0])<<8 | int16(b[1])
-	raw = raw >> 2
+
+	isValid := nDVtoBool(raw)
+	if !isValid {
+		return 0.0, errors.New("nDV bit is set")
+	}
+	raw = raw >> 2 // trim nDV[0] and empty bit[1]
 
 	// 0.03125°C per LSB
 	tDie := float64(raw) * 0.03125 // convert to Celcius
 
-	return tDie
+	return tDie, nil
 }
 
 // ReadObjTempC returns the object temperature in degrees Celcius
-func (d *TMP007Driver) ReadObjTempC() float64 {
-	b, _ := d.read(tmp007RegisterTObj, 2)
+func (d *TMP007Driver) ReadObjTempC() (float64, error) {
+	b, err := d.read(tmp007RegisterTObj, 2)
+	if err != nil {
+		return 0.0, err
+	}
 	raw := int16(b[0])<<8 | int16(b[1])
+
+	isValid := nDVtoBool(raw)
+	if !isValid {
+		return 0.0, errors.New("nDV bit is set")
+	}
 	raw = raw >> 2 // trim nDV[0] and empty bit[1]
 
 	// 0.03125°C per LSB
 	tObj := float64(raw) * 0.03125 // convert to Celcius
 
-	return tObj
+	return tObj, err
 }
 
 // ReadSensorVoltage returns the sensor voltage output value in microvolts
-func (d *TMP007Driver) ReadSensorVoltage() float64 {
-	b, _ := d.read(tmp007RegisterVSensor, 2)
+func (d *TMP007Driver) ReadSensorVoltage() (float64, error) {
+	b, err := d.read(tmp007RegisterVSensor, 2)
+	if err != nil {
+		return 0.0, err
+	}
 	raw := int16(b[0])<<8 | int16(b[1])
 
 	// Resolution: 156.25 nV/LSB
 	vSensor := (float64(raw) * 156.25) / 1000 // convert to uV
 
-	return vSensor
+	return vSensor, err
+}
+
+// ReadStatus returns the 16-bit status register
+func (d *TMP007Driver) ReadStatus() (uint16, error) {
+	b, err := d.read(tmp007RegisterStatus, 2)
+	if err != nil {
+		return 0, err
+	}
+	raw := uint16(b[0])<<8 | uint16(b[1])
+
+	return raw, err
+}
+
+// WaitOnConversionReady polls status register and returns when CRTF bit is set
+func (d *TMP007Driver) WaitOnConversionReady() {
+	for {
+		s, err := d.ReadStatus()
+		if ((tmp007MaskCRTEN & s) != 0) && err == nil {
+			return
+		}
+		time.Sleep(65 * time.Millisecond) // 65 = min conv. time 260ms / 4
+	}
 }
