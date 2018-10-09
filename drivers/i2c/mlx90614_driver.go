@@ -3,6 +3,7 @@ package i2c
 import (
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"gobot.io/x/gobot"
@@ -13,6 +14,7 @@ const (
 	mlx90614DefaultSlaveAddress = 0x5A
 
 	// RAM read only, opcode 000x_xxxx
+	mlx90614RegisterRaw1  = 0x04 // RAM Channel 1
 	mlx90614RegisterTA    = 0x06 // Linearized ambient temperature TA
 	mlx90614RegisterTObj1 = 0x07 // Linearized object temperature Tobj1
 	mlx90614RegisterTObj2 = 0x08 // Linearized object temperature Tobj2
@@ -134,7 +136,7 @@ func (d *MLX90614Driver) Halt() (err error) {
 func (d *MLX90614Driver) initialization() (err error) {
 	addr8, err := d.ReadAddress()
 	if err != nil {
-		return fmt.Errorf("MLX90614::initialization() failed to communicate with slave device: %v", err)
+		return fmt.Errorf("MLX90614::initialization() failed to communicate with slave device:\n\t%v", err)
 	}
 
 	addrExpected := d.GetAddressOrDefault(mlx90614DefaultSlaveAddress)
@@ -145,113 +147,59 @@ func (d *MLX90614Driver) initialization() (err error) {
 	return nil
 }
 
-// CRC-8-CCITT: x^8 + x^2 + x^1 + x^0 polynomial
-func crc8ccitt(inCRC uint8, inData uint8) uint8 {
-	data := inCRC ^ inData
-
-	for i := 0; i < 8; i++ {
-		data <<= 1
-		if (data & 0x80) != 0 {
-			data ^= 0x07
-		}
-	}
-
-	return data
-}
-
-// Datasheet says "Write Word" is only supported SMBus write command, WriteWordData()?
-// TODO Guard: Ke [15...0]; Config Register1 [14...11;7;3]; addresses 0x0F and 0x19.
-func (d *MLX90614Driver) write(address byte, data uint16) error {
-	lsb := uint8(data & 0x00FF)
-	msb := uint8(data >> 8)
-
-	// Generate PEC: Packet Error Code (Datasheet §8.4.3.1)
-	pec := crc8ccitt(0, uint8((d.GetAddressOrDefault(mlx90614DefaultSlaveAddress) << 1))) // Slave Write Address
-	pec = crc8ccitt(pec, address)                                                         // Command
-	pec = crc8ccitt(pec, lsb)                                                             // Data Byte Low
-	pec = crc8ccitt(pec, msb)                                                             // Data Byte High
-
-	// For the Raspberry Pi platform, "repeated start" is automatically triggered by the i2c_bcm2835 module
-	// else "combined transactions" should be enabled: https://www.raspberrypi.org/forums/viewtopic.php?f=44&t=15840&start=25
-	return d.connection.WriteBlockData(address, []byte{address, lsb, msb, pec})
-}
-
-// Datasheet says "Read Word" is only supported SMBus read command, ReadWordData()?
-func (d *MLX90614Driver) read(address byte, n int) ([]byte, error) {
-	// Send Command to slave device
-	if _, err := d.connection.Write([]byte{address}); err != nil {
-		return nil, fmt.Errorf("MLX90614::read() failed to send command: %v", err)
-	}
-
-	// Expecting 3 bytes: lsb, msb, pec
-	buf := make([]byte, n)
+// Datasheet says "Read Word" is only supported SMBus read command, so ReadWordData()
+func (d *MLX90614Driver) read(address byte) (uint16, error) {
 	var err error
-	var bytesRead int
-	numRetries := 50
+	var val16 uint16
+	numRetries := 10
+
 	for numRetries > 0 {
-		bytesRead, err = d.connection.Read(buf)
-		if bytesRead == n && err == nil {
+		val16, err = d.connection.ReadWordData(address)
+		if err == nil {
 			break
 		}
 		numRetries--
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("MLX90614::read() failed to read from connection: %v", err)
+		return 0x00, fmt.Errorf("MLX90614::read() error:\n\t%v", err)
 	}
 
-	lsb := uint8(buf[0])
-	msb := uint8(buf[1])
-	pecIncoming := uint8(buf[2])
-
-	// Generate PEC: Packet Error Code (Datasheet §8.4.3.1)
-	pec := crc8ccitt(0, uint8((d.GetAddressOrDefault(mlx90614DefaultSlaveAddress) << 1)))  // Slave Write Address
-	pec = crc8ccitt(pec, address)                                                          // Command
-	pec = crc8ccitt(pec, uint8((d.GetAddressOrDefault(mlx90614DefaultSlaveAddress)<<1))+1) // Slave Read Address
-	pec = crc8ccitt(pec, lsb)                                                              // Data Byte Low
-	pec = crc8ccitt(pec, msb)                                                              // Data Byte High
-
-	if pecIncoming == pec {
-		return buf, nil
-	}
-
-	return nil, fmt.Errorf("MLX90614::read() PEC mismatch exp:%X act:%X", pec, pecIncoming)
+	return val16, err
 }
 
-func (d *MLX90614Driver) readUint16(address byte) (uint16, error) {
-	b, err := d.read(address, 3)
-	if err != nil {
-		return 0, fmt.Errorf("MLX90614::readUint16() failed: %v", err)
+// Datasheet says "Write Word" is only supported SMBus write command, so WriteWordData()
+func (d *MLX90614Driver) write(address byte, data uint16) error {
+	switch address {
+	case mlx90614RegisterKE:
+		fallthrough
+	case 0x19:
+		fallthrough
+	case 0x0F:
+		return errors.New("Refusing to write to protected register, see datasheet")
 	}
 
-	raw := uint16(b[0])<<8 | uint16(b[1])
-	return raw, nil
-}
+	log.Printf("Writing: %X (%b) to %X (%b)\n", data, data, address, address)
 
-func (d *MLX90614Driver) readInt16(address byte) (int16, error) {
-	b, err := d.read(address, 3)
-	if err != nil {
-		return 0, err
-	}
-
-	raw := int16(b[0])<<8 | int16(b[1])
-	return raw, nil
+	// For the Raspberry Pi platform, "repeated start" is automatically triggered by the i2c_bcm2835 module
+	// else "combined transactions" should be enabled: https://www.raspberrypi.org/forums/viewtopic.php?f=44&t=15840&start=25
+	return d.connection.WriteWordData(address, data)
 }
 
 func (d *MLX90614Driver) writeEEPROM(address byte, data uint16) error {
 	// "A write of 0x0000 must be done prior to writing in EEPROM in order to erase the
 	// EEPROM cell content."
 	if err := d.write(address, 0); err != nil {
-		return fmt.Errorf("MLX90614::writeEEPROM() failed to erase cell content: %v", err)
+		return fmt.Errorf("MLX90614::writeEEPROM() failed to erase cell content:\n\t%v", err)
 	}
 
-	time.Sleep(5 * time.Millisecond) // Delay tErase
+	time.Sleep(5 * time.Millisecond) // Delay tErase = 5ms
 
 	if err := d.write(address, data); err != nil {
-		return fmt.Errorf("MLX90614::writeEEPROM() failed to write new cell content: %v", err)
+		return fmt.Errorf("MLX90614::writeEEPROM() failed to write new cell content:\n\t%v", err)
 	}
 
-	time.Sleep(5 * time.Millisecond) // Delay tWrite
+	time.Sleep(5 * time.Millisecond) // Delay tWrite = 5ms
 
 	return nil
 }
@@ -276,12 +224,12 @@ func wake() {
 
 // ReadAddress returns the 7-bit SMBus slave address from EEPROM
 func (d *MLX90614Driver) ReadAddress() (uint8, error) {
-	addr16, err := d.readUint16(mlx90614RegisterAddress)
+	val16, err := d.read(mlx90614RegisterAddress)
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::ReadAddress() failed: %v", err)
+		return 0, fmt.Errorf("MLX90614::ReadAddress() failed:\n\t%v", err)
 	}
 
-	return uint8(addr16), nil
+	return uint8(val16), nil
 }
 
 // WriteAddress stores a new 7-bit SMBus slave address into EEPROM, reset required
@@ -291,30 +239,21 @@ func (d *MLX90614Driver) WriteAddress(newAddress uint8) error {
 		return errors.New("MLX90614::WriteAddress() invalid or reserved SMBus address")
 	}
 
-	tempAddr16, err := d.readUint16(mlx90614RegisterAddress)
-	if err != nil {
-		return fmt.Errorf("MLX90614::WriteAddress() failed: %v", err)
-	}
-
-	tempAddr16 &= 0xFF00
-	tempAddr16 |= uint16(newAddress)
-
-	return d.writeEEPROM(mlx90614RegisterAddress, tempAddr16)
+	return d.writeEEPROM(mlx90614RegisterAddress, uint16(newAddress))
 }
 
 // ReadID returns the Device ID registers into a slice of bytes
-func (d *MLX90614Driver) ReadID() ([]byte, error) {
-	var id64 []byte
+func (d *MLX90614Driver) ReadID() (uint64, error) {
+	var id64 uint64
 
 	// Construct ID word by word
 	for i := byte(0); i < 4; i++ {
-		tempBuf, err := d.read(mlx90614RegisterID0+i, 3)
+		id16, err := d.read(mlx90614RegisterID0 + i)
 		if err != nil {
-			return id64, fmt.Errorf("MLX90614::ReadID() failed on part %d: %v", i, err)
+			return id64, fmt.Errorf("MLX90614::ReadID() failed on part %d:\n\t%v", i, err)
 		}
-
-		id64 = append(id64, tempBuf[0]) // lsb
-		id64 = append(id64, tempBuf[1]) // msb
+		id64 |= uint64(id16) << (i * 16)
+		log.Printf("ID%d:%X (%b)\n%b\n", i, id16, id16, id64)
 	}
 
 	return id64, nil
@@ -322,19 +261,54 @@ func (d *MLX90614Driver) ReadID() ([]byte, error) {
 
 // ReadEmissivity returns the emissivity value from EEPROM, normalised between 0.1 and 1.0
 func (d *MLX90614Driver) ReadEmissivity() (float64, error) {
-	ke, err := d.readUint16(mlx90614RegisterKE)
+	ke, err := d.read(mlx90614RegisterKE)
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::ReadEmissivity() failed: %v", err)
+		return 0, fmt.Errorf("MLX90614::ReadEmissivity() failed:\n\t%v", err)
 	}
 
 	return (float64(ke) / 65535.0), nil
 }
 
+// ReadReg returns the raw reg data
+func (d *MLX90614Driver) ReadReg(reg byte) (int16, error) {
+	raw, err := d.read(reg)
+	if err != nil {
+		return 0, fmt.Errorf("MLX90614::ReadReg() failed:\n\t%v", err)
+	}
+
+	var rawSigned int16
+	if (raw & 0x8000) != 0 {
+		rawSigned = -(int16(raw) & 0x00FF)
+	} else {
+		rawSigned = int16(raw)
+	}
+
+	return rawSigned, nil
+}
+
+// ReadIRChannel1 returns the raw IR data register value
+func (d *MLX90614Driver) ReadIRChannel1() (int16, error) {
+	rawObj, err := d.read(mlx90614RegisterRaw1)
+	if err != nil {
+		return 0, fmt.Errorf("MLX90614::ReadIRChannel1() failed:\n\t%v", err)
+	}
+	// log.Printf("rawObj = %X", rawObj)
+
+	var irSigned int16
+	if (rawObj & 0x8000) != 0 {
+		irSigned = -(int16(rawObj) & 0x00FF)
+	} else {
+		irSigned = int16(rawObj)
+	}
+
+	return irSigned, nil
+}
+
 // ReadTObj1Raw returns the raw TObj1 data
 func (d *MLX90614Driver) ReadTObj1Raw() (uint16, error) {
-	rawObj, err := d.readUint16(mlx90614RegisterTObj1)
+	rawObj, err := d.read(mlx90614RegisterTObj1)
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::ReadTObj1Raw() failed: %v", err)
+		return 0, fmt.Errorf("MLX90614::ReadTObj1Raw() failed:\n\t%v", err)
 	}
 
 	if (rawObj & 0x8000) != 0 {
@@ -346,9 +320,9 @@ func (d *MLX90614Driver) ReadTObj1Raw() (uint16, error) {
 
 // ReadTObj2Raw returns the raw TObj2 data
 func (d *MLX90614Driver) ReadTObj2Raw() (uint16, error) {
-	rawObj, err := d.readUint16(mlx90614RegisterTObj2)
+	rawObj, err := d.read(mlx90614RegisterTObj2)
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::ReadTObj2Raw() failed: %v", err)
+		return 0, fmt.Errorf("MLX90614::ReadTObj2Raw() failed:\n\t%v", err)
 	}
 
 	if (rawObj & 0x8000) != 0 {
@@ -360,9 +334,9 @@ func (d *MLX90614Driver) ReadTObj2Raw() (uint16, error) {
 
 // ReadAmbientTempRaw returns the raw TA data
 func (d *MLX90614Driver) ReadAmbientTempRaw() (uint16, error) {
-	rawAmb, err := d.readUint16(mlx90614RegisterTA)
+	rawAmb, err := d.read(mlx90614RegisterTA)
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::ReadAmbientTempRaw() failed: %v", err)
+		return 0, fmt.Errorf("MLX90614::ReadAmbientTempRaw() failed:\n\t%v", err)
 	}
 
 	return rawAmb, nil
@@ -370,9 +344,9 @@ func (d *MLX90614Driver) ReadAmbientTempRaw() (uint16, error) {
 
 // ReadTOMinRaw returns the raw TO Min data from EEPROM
 func (d *MLX90614Driver) ReadTOMinRaw() (uint16, error) {
-	toMin, err := d.readUint16(mlx90614RegisterTOMin)
+	toMin, err := d.read(mlx90614RegisterTOMin)
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::ReadTOMinRaw() failed: %v", err)
+		return 0, fmt.Errorf("MLX90614::ReadTOMinRaw() failed:\n\t%v", err)
 	}
 
 	return toMin, nil
@@ -380,9 +354,9 @@ func (d *MLX90614Driver) ReadTOMinRaw() (uint16, error) {
 
 // ReadTOMaxRaw returns the raw TO Max data from EEPROM
 func (d *MLX90614Driver) ReadTOMaxRaw() (uint16, error) {
-	toMax, err := d.readUint16(mlx90614RegisterTOMax)
+	toMax, err := d.read(mlx90614RegisterTOMax)
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::ReadTOMaxRaw() failed: %v", err)
+		return 0, fmt.Errorf("MLX90614::ReadTOMaxRaw() failed:\n\t%v", err)
 	}
 
 	return toMax, nil
@@ -395,17 +369,17 @@ func (d *MLX90614Driver) ConvertRawTempToDegK(raw uint16) float64 {
 
 // ConvertRawTempToDegC converts raw 16bit data to degrees celcius
 func (d *MLX90614Driver) ConvertRawTempToDegC(raw uint16) float64 {
-	return float64(raw)*0.02 - 273.15
+	return float64(int16(raw))*0.02 - 273.15
 }
 
 // ConvertRawTempToDegF converts raw 16bit data to degrees farenheit
 func (d *MLX90614Driver) ConvertRawTempToDegF(raw uint16) float64 {
-	return (float64(raw)*0.02-273.15)*9/5 + 32
+	return (float64(int16(raw))*0.02-273.15)*9/5 + 32
 }
 
 // ReadConfig returns the 16bit Config1 register from EEPROM
 func (d *MLX90614Driver) ReadConfig() (uint16, error) {
-	return d.readUint16(mlx90614RegisterConfig)
+	return d.read(mlx90614RegisterConfig)
 }
 
 // WriteFilterConfig stores the supplied FIR and IIR settings into EEPROM, returns
@@ -423,15 +397,41 @@ func (d *MLX90614Driver) WriteFilterConfig(fir uint8, iir uint8) (float64, error
 
 	config, err := d.ReadConfig()
 	if err != nil {
-		return 0, fmt.Errorf("MLX90614::WriteFilterConfig() failed to read config: %v", err)
+		return 0, fmt.Errorf("MLX90614::WriteFilterConfig() failed to read config:\n\t%v", err)
 	}
 
+	tSet := d.SettlingTimeFromConfig(config)
+
+	// Overwrite FIR bits 10..8
+	fir16 := uint16(fir) << 8
+	config &= 0xF8FF
+	config |= fir16
+
+	// Overwrite IIR IIR bits 2..0
+	iir16 := uint16(iir)
+	config &= 0xFFF8
+	config |= iir16
+
+	// Store new filter settings
+	err = d.writeEEPROM(mlx90614RegisterConfig, config)
+	if err != nil {
+		return tSet, fmt.Errorf("MLX90614::WriteFilterConfig() failed:\n\t%v", err)
+	}
+
+	return tSet, nil
+}
+
+// SettlingTimeFromConfig calculates the settling time in milliseconds
+func (d *MLX90614Driver) SettlingTimeFromConfig(config uint16) float64 {
 	// Single IR sensor
 	dual := float64(0)
 	if (config & 0x40) != 0 {
 		// Dual IR sensor
 		dual = float64(1)
 	}
+
+	fir := uint8(config & 0x700 >> 8)
+	iir := uint8(config & 0x7)
 
 	firSettingsMap := map[uint8]float64{
 		0x04: 5.184,
@@ -455,23 +455,5 @@ func (d *MLX90614Driver) WriteFilterConfig(fir uint8, iir uint8) (float64, error
 	iirS := iirSettingsMap[iir]
 
 	// Settling time, in milliseconds. Formula from digital signal filters appnote.
-	tSet := 9.719 + (iirS * (firS + 5.26)) + (iirS * (firS + 12.542)) + (dual * iirS * (firS + 12.542))
-
-	// Set FIR bits 10..8
-	fir16 := uint16(fir)
-	fir16 <<= 8
-
-	// Set FIR bits 2..0
-	iir16 := uint16(iir)
-
-	config |= fir16
-	config |= iir16
-
-	// Store new filter settings
-	err = d.writeEEPROM(mlx90614RegisterConfig, config)
-	if err != nil {
-		return tSet, fmt.Errorf("MLX90614::WriteFilterConfig() failed: %v", err)
-	}
-
-	return tSet, nil
+	return 9.719 + (iirS * (firS + 5.26)) + (iirS * (firS + 12.542)) + (dual * iirS * (firS + 12.542))
 }
