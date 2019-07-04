@@ -150,10 +150,11 @@ func (d *CalipileDriver) initialization() (err error) {
 		return fmt.Errorf("CalipileDriver::initialization() failed to initialize device:\n\t%v", err)
 	}
 
-	addrExpected := uint8(d.GetAddressOrDefault(calipileDefaultSlaveAddress))
-	if d.eeprom.slaveAddress != addrExpected {
-		return fmt.Errorf("CalipileDriver::initialization() I2C slave address mismatch, expected:%02X actual:%02X", addrExpected, d.eeprom.slaveAddress)
-	}
+	// Commented out as the EEPROM readout doesn't appear to obey the A0/A1 levels
+	// addrExpected := uint8(d.GetAddressOrDefault(calipileDefaultSlaveAddress))
+	// if d.eeprom.slaveAddress != addrExpected {
+	// 	return fmt.Errorf("CalipileDriver::initialization() I2C slave address mismatch, expected:%02X actual:%02X", addrExpected, d.eeprom.slaveAddress)
+	// }
 
 	// See datasheet section 8.5
 	d.eeprom.k = (float64(d.eeprom.uOut1) - float64(d.eeprom.u0)) / (math.Pow(float64(d.eeprom.tObj1)+273.15, 3.8) - math.Pow(25.0+273.15, 3.8))
